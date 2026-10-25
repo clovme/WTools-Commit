@@ -1,0 +1,23 @@
+[package]
+name = "commit"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "commit"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.dev]
+incremental = true # 以较小的步骤编译您的二进制文件。
+
+[profile.release]
+opt-level = "z"     # 修正："z" 为极致优化体积，"s" 为平衡体积与速度。
+codegen-units = 1   # 最大化优化，代价是单线程缓慢编译。
+lto = "fat"         # 跨 crate 的全局深度优化（写 true 也可以，fat 更明确）。
+panic = "abort"     # 禁用栈展开代码。
+strip = true        # 剔除调试信息和符号表。
+
+[lints.rust]
+non_snake_case = "allow"
