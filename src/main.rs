@@ -1885,7 +1885,8 @@ fn print_usage() {
          不填则按类型自动选择；分卷命名为 源名[pack].7z.001，与源文件同目录\n  \
          - push 时若源文件比对应分卷新，会提示重新 pack（不阻断提交）\n  \
          - 分支策略：使用当前所在分支；detached HEAD 时跟随 origin/HEAD，或在 main / master 中选择实际存在的分支\n  \
-         - push 无需提交信息：自动取 add 后的暂存摘要，取不到时固定为 ^Q^"
+         - push 无需提交信息：自动取 add 后的暂存摘要，取不到时固定为 ^Q^ \n \
+         - Git 仓库地址：https://github.com/clovme/WTools-Commit.git"
     );
 }
 
