@@ -1719,7 +1719,7 @@ fn cmd_logout(root: &Path, user: Option<&str>) {
 //
 // 大文件绕过 GitHub 单文件 100MB 限制的工作流（替代有配额限制的 Git LFS）：
 //   * commit pack <文件/目录> [等级]
-//       7z 分卷压缩（默认 45MB/卷），分卷放在源文件旁边，命名为
+//       7z 分卷压缩（默认 50MB/卷），分卷放在源文件旁边，命名为
 //       `源名[pack].7z.001`、`.002`……；归档内保留相对所属仓库根的路径。
 //       随后把源文件写入该仓库 .gitignore 的自动管理块；已跟踪的源文件
 //       执行 git rm --cached（保留本地文件）。之后正常 commit push 即可。
@@ -1731,9 +1731,9 @@ fn cmd_logout(root: &Path, user: Option<&str>) {
 
 const PACK_MAIN_SUFFIX: &str = "[pack].7z.001";
 const PACK_ARCHIVE_SUFFIX: &str = "[pack].7z";
-// 卷大小取 45MiB（≈47.2MB），确保单卷低于 GitHub 50MB 建议线，
+// 卷大小取 50MiB（≈47.2MB），确保单卷低于 GitHub 50MB 建议线，
 // 既不触发 50MB 警告，也远低于 100MB 硬限制。
-const PACK_VOLUME_SIZE: &str = "45m";
+const PACK_VOLUME_SIZE: &str = "50M";
 
 const IGNORE_BEGIN: &str = "# >>> commit pack (managed) >>>";
 const IGNORE_END: &str = "# <<< commit pack (managed) <<<";
@@ -2261,7 +2261,7 @@ fn print_usage() {
          用法:\n  \
          commit pull           拉取主仓库并初始化/同步全部子模块\n  \
          commit push           逐个提交并推送子模块，再提交并推送主仓库\n  \
-         commit pack <路径>    把大文件/目录分卷压缩为 45MB 的 7z 分卷（自动忽略源文件）\n  \
+         commit pack <路径>    把大文件/目录分卷压缩为 50MB 的 7z 分卷（自动忽略源文件）\n  \
          commit unpack         扫描并还原全部 [pack] 分卷（新克隆后执行）\n  \
          commit login [用户]   切换/登录 Git 账号（默认取仓库 URL 中的账号）\n  \
          commit logout [用户]  注销 Git 凭据（不指定用户则注销全部）\n\n\
