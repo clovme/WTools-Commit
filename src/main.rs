@@ -137,6 +137,45 @@ fn git_run_opts(repo: &Path, args: &[&str], mode: AuthMode) -> bool {
     }
 }
 
+/// 执行 git（通常是 push）：stdout/stderr 实时透传，同时收集 stderr 文本，
+/// 返回 (是否成功, stderr)。用于在保留进度显示的同时解析 GitHub 报错。
+fn git_run_collect_stderr(repo: &Path, args: &[&str]) -> (bool, String) {
+    use std::io::Read;
+    use std::thread;
+    let mut cmd = git_command(repo, args);
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            warn(&format!("无法启动 git：{e}"));
+            return (false, String::new());
+        }
+    };
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = thread::spawn(move || -> String {
+        let mut collected = String::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    eprint!("{chunk}");
+                    let _ = std::io::stderr().flush();
+                    collected.push_str(&chunk);
+                }
+                Err(_) => break,
+            }
+        }
+        collected
+    });
+    let status = child.wait();
+    let collected = reader.join().unwrap_or_default();
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    (ok, collected)
+}
+
 /// 返回某路径所属 git 仓库的根（toplevel）；不在仓库内时返回 None。
 fn git_toplevel_of(path: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() {
@@ -933,6 +972,312 @@ fn checkout_main_if_detached(root: &Path, branch: &str) {
 
 // ---------- push ----------
 
+/// push 输出中识别出的超限文件。
+#[derive(Clone)]
+struct LargeFile {
+    /// 相对该仓库根的路径。
+    path: String,
+    size_mb: f64,
+    /// true=超过 100MB 硬限制（被拒）；false=50MB 建议警告（不阻断）。
+    hard: bool,
+}
+
+/// 从 GitHub push 输出中解析超限文件（按路径去重）。
+/// 形如：
+///   remote: error: File zyplayer/resources/app.asar is 133.28 MB; this exceeds GitHub's file size limit of 100.00 MB
+///   remote: warning: File xx[pack].7z.001 is 54.80 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB
+fn parse_large_files(output: &str) -> Vec<LargeFile> {
+    let mut result: Vec<LargeFile> = Vec::new();
+    for line in output.lines() {
+        let lower = line.to_lowercase();
+        if !lower.contains("file size limit") && !lower.contains("maximum file size") {
+            continue;
+        }
+        let Some(file_idx) = line.find("File ") else {
+            continue;
+        };
+        let after = &line[file_idx + 5..];
+        let Some(is_idx) = after.find(" is ") else {
+            continue;
+        };
+        let path = after[..is_idx].trim().replace('\\', "/");
+        let rest = &after[is_idx + 4..];
+        let Some(mb_idx) = rest.find(" MB") else {
+            continue;
+        };
+        let size_mb: f64 = rest[..mb_idx].trim().parse().unwrap_or(0.0);
+        if path.is_empty() || size_mb <= 0.0 {
+            continue;
+        }
+        let hard = lower.contains("exceeds") || lower.contains("gh001");
+        if !result.iter().any(|f| f.path == path) {
+            result.push(LargeFile {
+                path,
+                size_mb,
+                hard,
+            });
+        }
+    }
+    result
+}
+
+/// 把仓库内相对路径补全为相对主仓库根的 pack 目标路径。
+/// 子模块 prefix 为 `Entertainment`，文件 `zyplayer/app.asar`
+/// → `Entertainment/zyplayer/app.asar`；主仓库 prefix 为空则原样返回。
+fn join_pack_path(sub_prefix: &str, file_in_repo: &str) -> String {
+    let prefix = sub_prefix.trim_matches('/').replace('\\', "/");
+    let file = file_in_repo.trim_matches('/').replace('\\', "/");
+    if prefix.is_empty() {
+        file
+    } else {
+        format!("{prefix}/{file}")
+    }
+}
+
+/// 100 MiB（GitHub 单文件硬限制），单位字节。
+const GITHUB_HARD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// push 前本地预检：扫描未推送提交历史 `remote_ref..HEAD` 中超过 100MB 的 blob，
+/// 路径为当前仓库相对路径。GitHub 对所有待推送对象逐个检查大小，即使某大文件
+/// 在最新提交里已被删除、只存在于中间提交，仍会被拒绝；提前本地发现可避免
+/// 传完几百 MB 才被服务端拒绝（或在传输中途超时）。
+fn local_hard_large_files(repo: &Path, remote_ref: &str) -> Vec<LargeFile> {
+    let mut result: Vec<LargeFile> = Vec::new();
+    let range = format!("{remote_ref}..HEAD");
+    // rev-list --objects 列出范围内所有对象（<sha> <path>），交给
+    // cat-file --batch-check 批量取类型/大小。
+    let mut list = match git_command(repo, &["rev-list", "--objects", &range])
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return result,
+    };
+    let list_out = match list.stdout.take() {
+        Some(h) => h,
+        None => return result,
+    };
+    let check = match git_command(
+        repo,
+        &[
+            "cat-file",
+            "--batch-check=%(objecttype) %(objectsize) %(rest)",
+        ],
+    )
+    .stdin(Stdio::from(list_out))
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = list.wait();
+            return result;
+        }
+    };
+    let check_out = check.wait_with_output();
+    let _ = list.wait();
+    let text = match check_out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return result,
+    };
+    for line in text.lines() {
+        // 形如 "blob 139757212 zyplayer/resources/app.asar"；路径可含空格。
+        let mut it = line.splitn(3, ' ');
+        let kind = it.next().unwrap_or("");
+        let size_s = it.next().unwrap_or("0");
+        let path = it.next().unwrap_or("").trim();
+        if kind != "blob" || path.is_empty() {
+            continue;
+        }
+        let size: u64 = size_s.parse().unwrap_or(0);
+        if size >= GITHUB_HARD_BYTES && !result.iter().any(|f| f.path == path) {
+            result.push(LargeFile {
+                path: path.replace('\\', "/"),
+                size_mb: size as f64 / (1024.0 * 1024.0),
+                hard: true,
+            });
+        }
+    }
+    result
+}
+
+/// 判断 push 失败是否为可重试的网络/传输层错误（HTTP 408/5xx、连接中断、
+/// RPC 失败、远端挂断等），而非大文件、鉴权或内容问题。
+fn is_network_error(out: &str) -> bool {
+    let s = out.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "rpc failed",
+        "http 408",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "unexpected disconnect",
+        "remote end hung up",
+        "early eof",
+        "connection was reset",
+        "connection reset by peer",
+        "connection timed out",
+        "could not resolve host",
+        "failed to send",
+        "transfer closed",
+        "server closed abruptly",
+        "schannel: recv failure",
+        "curl 56",
+        "curl 18",
+        "operation timed out",
+    ];
+    MARKERS.iter().any(|m| s.contains(m))
+}
+
+/// 单次 push（可附额外 `-c` 临时配置，仅本次命令生效，不写 .gitconfig）。
+fn push_once(repo: &Path, branch: &str, extra: &[&str]) -> (bool, String) {
+    let mut args: Vec<&str> = Vec::with_capacity(extra.len() + 4);
+    args.extend_from_slice(extra);
+    args.push("push");
+    args.push("--progress");
+    args.push("origin");
+    args.push(branch);
+    git_run_collect_stderr(repo, &args)
+}
+
+/// 带网络自愈的 push：遇到网络类错误自动重试，逐步增强传输参数
+/// （增大 postBuffer、放宽低速超时）。基础命令已默认启用 HTTP/1.1。
+/// 一旦出现 100MB 大文件硬错误，立即返回，交由上层修复（不浪费重试）。
+/// 返回 (是否成功, 最后一次的 stderr)。
+fn push_robust(repo: &Path, branch: &str) -> (bool, String) {
+    // 每轮叠加的 -c 参数（均为临时、不写入配置）。
+    let attempts: [&[&str]; 4] = [
+        &[],
+        &["-c", "http.postBuffer=524288000"],
+        &[
+            "-c",
+            "http.postBuffer=524288000",
+            "-c",
+            "http.lowSpeedTime=300",
+        ],
+        &[
+            "-c",
+            "http.postBuffer=524288000",
+            "-c",
+            "http.lowSpeedTime=300",
+        ],
+    ];
+    const HINT: [&str; 4] = [
+        "推送中...",
+        "将增大 HTTP 提交缓冲（postBuffer=500MB）后重试...",
+        "将进一步放宽低速超时（lowSpeedTime=300s）后重试...",
+        "最后一次重试...",
+    ];
+    const WAIT_SECS: [u64; 4] = [0, 5, 10, 20];
+    let mut last = String::new();
+    for (i, cfg) in attempts.iter().enumerate() {
+        if WAIT_SECS[i] > 0 {
+            warn(&format!("推送网络异常，等待 {} 秒后重试。", WAIT_SECS[i]));
+            std::thread::sleep(std::time::Duration::from_secs(WAIT_SECS[i]));
+        }
+        if i > 0 {
+            warn(HINT[i]);
+        }
+        let (ok, err) = push_once(repo, branch, cfg);
+        last = err;
+        if ok {
+            return (true, last);
+        }
+        // 大文件硬错误：交给上层 repair 流程，网络重试无意义。
+        if parse_large_files(&last).iter().any(|f| f.hard) {
+            return (false, last);
+        }
+        // 非网络错误（鉴权、内容、非快进等）：不重试，直接返回让上层中止。
+        if !is_network_error(&last) {
+            return (false, last);
+        }
+    }
+    (false, last)
+}
+
+/// push 被 100MB 硬限制拒绝后：软回退未推送提交 → 自动 pack 超限文件 →
+/// 重新提交 → 再次推送。repo 为出问题的仓库（主仓库或子模块），
+/// sub_prefix 为该仓库相对主仓库根的前缀（主仓库为空串）。
+fn repair_and_repush(
+    root: &Path,
+    repo: &Path,
+    sub_prefix: &str,
+    label: &str,
+    branch: &str,
+    hard: &[LargeFile],
+) -> bool {
+    let remote_ref = format!("origin/{branch}");
+    warn(&format!(
+        "{label} 的未推送提交含超过 GitHub 100MB 限制的文件；\
+         工具将自动撤销该提交，把大文件压缩（或在其已被删除时仅重写历史）后重新提交。"
+    ));
+    for f in hard {
+        println!("  超限文件：{}（{:.2} MB）", f.path, f.size_mb);
+        println!(
+            "  补全命令：commit pack {}",
+            join_pack_path(sub_prefix, &f.path)
+        );
+    }
+
+    // 1) 软回退到远程分支：撤销未推送提交，改动全部保留在暂存区，不丢任何工作。
+    println!("  撤销未推送的提交（git reset --soft {remote_ref}，工作区改动保留）...");
+    if !git_run(repo, &["reset", "--soft", &remote_ref]) {
+        die(&format!(
+            "{label} 无法回退未推送提交，请手动执行 git reset --soft {remote_ref} 后重试。"
+        ));
+    }
+
+    // 2) 压缩仍在暂存区的超限文件；已在最新提交里移除/压缩过的（reset 后
+    //    暂存区已不含它）只随回退重写历史即可，不重复打包，避免重复压缩。
+    for f in hard {
+        let full = join_pack_path(sub_prefix, &f.path);
+        if !is_tracked(repo, &f.path) {
+            println!("  {full} 已在最新提交中移除/压缩，重写历史即可，无需重复打包。");
+            continue;
+        }
+        if !repo.join(&f.path).exists() {
+            warn(&format!(
+                "未在工作区找到 {full}，跳过自动打包，请手动确认。"
+            ));
+            continue;
+        }
+        cmd_pack(root, &full, "best");
+    }
+
+    // 3) 重新暂存（分卷与 .gitignore 入列，源文件已被忽略）并提交。
+    if !git_run(repo, &["add", "-A"]) {
+        die(&format!("{label} 修复后 git add 失败。"));
+    }
+    let msg = staged_message(repo);
+    println!("  重新提交，提交信息：{msg}");
+    if !git_run(repo, &["commit", "-m", &msg]) {
+        die(&format!("{label} 修复后 git commit 失败。"));
+    }
+
+    // 4) 再次推送（含网络重试）；仍失败则区分为“仍有大文件”或其它错误。
+    println!("  重新推送到 {remote_ref}...");
+    let (ok, err) = push_robust(repo, branch);
+    if !ok {
+        let remaining: Vec<String> = parse_large_files(&err)
+            .into_iter()
+            .filter(|f| f.hard)
+            .map(|f| f.path)
+            .collect();
+        if !remaining.is_empty() {
+            die(&format!(
+                "仍有超过 100MB 的文件未被压缩规避：{}；请确认 7z 分卷已生成后重试 commit push。",
+                remaining.join(", ")
+            ));
+        }
+        die(&format!("{label} 压缩大文件后仍推送失败，请检查上方输出。"));
+    }
+    println!("  [OK] {label} 已在处理超大文件（压缩/重写历史）后推送成功。");
+    true
+}
+
 fn cmd_push(root: &Path) {
     let (_main_url, main_branch) = print_header(root, "WTools 推送");
 
@@ -1009,10 +1354,39 @@ fn cmd_push(root: &Path) {
             ));
         }
 
-        if local_committed {
-            println!("  推送到 origin/{branch}...");
-            if !git_run(&sub_repo, &["push", "--progress", "origin", &branch]) {
-                die(&format!("子模块 {} push 失败。", sub.path));
+        // 即使本次没有新提交（例如上次 push 因大文件失败、本地仍领先远程），
+        // 只要本地领先 origin/{branch} 就需要推送。
+        let remote_ref = format!("origin/{branch}");
+        let local_ahead = ahead_count(&sub_repo, &remote_ref, "HEAD");
+        if local_committed || local_ahead > 0 {
+            // push 前本地预检：未推送历史里若含 >100MB 的 blob（即便在最新提交已被
+            // 删除），直接走修复（重写历史 / 压缩），避免传完才被拒或中途超时。
+            let local_hard = local_hard_large_files(&sub_repo, &remote_ref);
+            if local_hard.is_empty() {
+                println!("  推送到 origin/{branch}...");
+                let (push_ok, push_err) = push_robust(&sub_repo, &branch);
+                let large = parse_large_files(&push_err);
+                if !push_ok {
+                    let hard: Vec<LargeFile> = large.iter().filter(|f| f.hard).cloned().collect();
+                    if hard.is_empty() {
+                        die(&format!("子模块 {} push 失败。", sub.path));
+                    }
+                    // 服务端仍报大文件（预检阈值边界等）：自动修复后再推。
+                    repair_and_repush(root, &sub_repo, &sub.path, &sub.path, &branch, &hard);
+                } else {
+                    // 推送成功但存在 50MB 建议警告（不阻断）。
+                    for f in large.iter().filter(|f| !f.hard) {
+                        warn(&format!(
+                            "分卷 {}（{:.2} MB）超过 GitHub 50MB 建议值（不影响推送）；\
+                             如想消除提示，可用当前更小的分卷重新 pack。",
+                            join_pack_path(&sub.path, &f.path),
+                            f.size_mb
+                        ));
+                    }
+                }
+            } else {
+                // 预检即发现历史大文件，直接修复（内部会重写提交并重新推送）。
+                repair_and_repush(root, &sub_repo, &sub.path, &sub.path, &branch, &local_hard);
             }
             changed.push(sub.path.clone());
             println!("  [OK] {} 已推送", sub.path);
@@ -1032,8 +1406,22 @@ fn cmd_push(root: &Path) {
         if !git_run(root, &["commit", "-m", &msg]) {
             die("主仓库 git commit 失败。");
         }
-        if !git_run(root, &["push", "--progress", "origin", &main_branch]) {
-            die("主仓库 push 失败。");
+        let main_remote_ref = format!("origin/{main_branch}");
+        let local_hard = local_hard_large_files(root, &main_remote_ref);
+        if !local_hard.is_empty() {
+            repair_and_repush(root, root, "", "主仓库", &main_branch, &local_hard);
+        } else {
+            let (push_ok, push_err) = push_robust(root, &main_branch);
+            if !push_ok {
+                let hard: Vec<LargeFile> = parse_large_files(&push_err)
+                    .into_iter()
+                    .filter(|f| f.hard)
+                    .collect();
+                if hard.is_empty() {
+                    die("主仓库 push 失败。");
+                }
+                repair_and_repush(root, root, "", "主仓库", &main_branch, &hard);
+            }
         }
         println!("\n[OK] 全部推送完成。");
     } else if !changed.is_empty() {
@@ -1331,7 +1719,7 @@ fn cmd_logout(root: &Path, user: Option<&str>) {
 //
 // 大文件绕过 GitHub 单文件 100MB 限制的工作流（替代有配额限制的 Git LFS）：
 //   * commit pack <文件/目录> [等级]
-//       7z 分卷压缩（默认 90MB/卷），分卷放在源文件旁边，命名为
+//       7z 分卷压缩（默认 45MB/卷），分卷放在源文件旁边，命名为
 //       `源名[pack].7z.001`、`.002`……；归档内保留相对所属仓库根的路径。
 //       随后把源文件写入该仓库 .gitignore 的自动管理块；已跟踪的源文件
 //       执行 git rm --cached（保留本地文件）。之后正常 commit push 即可。
@@ -1343,7 +1731,9 @@ fn cmd_logout(root: &Path, user: Option<&str>) {
 
 const PACK_MAIN_SUFFIX: &str = "[pack].7z.001";
 const PACK_ARCHIVE_SUFFIX: &str = "[pack].7z";
-const PACK_VOLUME_SIZE: &str = "90m";
+// 卷大小取 45MiB（≈47.2MB），确保单卷低于 GitHub 50MB 建议线，
+// 既不触发 50MB 警告，也远低于 100MB 硬限制。
+const PACK_VOLUME_SIZE: &str = "45m";
 
 const IGNORE_BEGIN: &str = "# >>> commit pack (managed) >>>";
 const IGNORE_END: &str = "# <<< commit pack (managed) <<<";
@@ -1871,7 +2261,7 @@ fn print_usage() {
          用法:\n  \
          commit pull           拉取主仓库并初始化/同步全部子模块\n  \
          commit push           逐个提交并推送子模块，再提交并推送主仓库\n  \
-         commit pack <路径>    把大文件/目录分卷压缩为 90MB 的 7z 分卷（自动忽略源文件）\n  \
+         commit pack <路径>    把大文件/目录分卷压缩为 45MB 的 7z 分卷（自动忽略源文件）\n  \
          commit unpack         扫描并还原全部 [pack] 分卷（新克隆后执行）\n  \
          commit login [用户]   切换/登录 Git 账号（默认取仓库 URL 中的账号）\n  \
          commit logout [用户]  注销 Git 凭据（不指定用户则注销全部）\n\n\
@@ -2007,6 +2397,62 @@ mod tests {
         assert!(!is_volume_of("Motrix.exe", "Motrix.exe[pack].7z.bak"));
         assert!(!is_volume_of("Motrix.exe", "Motrix.exe[pack].7z"));
         assert!(!is_volume_of("Motrix.exe", "Other.exe[pack].7z.001"));
+    }
+
+    #[test]
+    fn parse_large_files_github_output() {
+        let output = "\
+remote: warning: File zyplayer/zyfun.exe[pack].7z.001 is 54.80 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB
+remote: error: Trace: abcdef
+remote: error: File zyplayer/resources/app.asar is 133.28 MB; this exceeds GitHub's file size limit of 100.00 MB
+remote: error: GH001: Large files detected.";
+        let files = parse_large_files(output);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "zyplayer/zyfun.exe[pack].7z.001");
+        assert!((files[0].size_mb - 54.80).abs() < 0.01);
+        assert!(!files[0].hard, "50MB 提示应为警告而非硬限制");
+        assert_eq!(files[1].path, "zyplayer/resources/app.asar");
+        assert!(files[1].hard, "133MB 超过 100MB 应为硬限制");
+        assert!((files[1].size_mb - 133.28).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_large_files_none() {
+        assert!(parse_large_files("Everything up-to-date\nDone").is_empty());
+        // 同一路径重复出现只记一次
+        let dup = "remote: error: File a/b.bin is 120.0 MB; this exceeds GitHub's file size limit of 100.00 MB\nremote: error: File a/b.bin is 120.0 MB; this exceeds GitHub's file size limit of 100.00 MB";
+        assert_eq!(parse_large_files(dup).len(), 1);
+    }
+
+    #[test]
+    fn is_network_error_detects_transient_failures() {
+        // 用户真机遇到的 408 断开
+        assert!(is_network_error(
+            "error: RPC failed; HTTP 408 curl 22 The requested URL returned error: 408\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly"
+        ));
+        // 常见 5xx / 连接中断
+        assert!(is_network_error("error: RPC failed; HTTP 502"));
+        assert!(is_network_error("fatal: early EOF"));
+        assert!(is_network_error("Recv failure: Connection was reset"));
+        // 鉴权类错误不应判为网络重试
+        assert!(!is_network_error(
+            "remote: HTTP 403 Forbidden\nAuthentication failed"
+        ));
+        assert!(!is_network_error("fatal: non-fast-forward"));
+        assert!(!is_network_error("Everything up-to-date"));
+    }
+
+    #[test]
+    fn join_pack_path_adds_submodule_prefix() {
+        assert_eq!(
+            join_pack_path("Entertainment", "zyplayer/resources/app.asar"),
+            "Entertainment/zyplayer/resources/app.asar"
+        );
+        assert_eq!(join_pack_path("", "tools/big.exe"), "tools/big.exe");
+        assert_eq!(
+            join_pack_path("Entertainment/", "/zyplayer/app.asar"),
+            "Entertainment/zyplayer/app.asar"
+        );
     }
 
     /// 环境相关的 FFI 冒烟测试：枚举本机凭据，验证目标名解析正确。
