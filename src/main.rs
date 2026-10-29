@@ -1225,9 +1225,8 @@ fn repair_and_repush(
     // 1) 软回退到远程分支：撤销未推送提交，改动全部保留在暂存区，不丢任何工作。
     println!("  撤销未推送的提交（git reset --soft {remote_ref}，工作区改动保留）...");
     if !git_run(repo, &["reset", "--soft", &remote_ref]) {
-        die(&format!(
-            "{label} 无法回退未推送提交，请手动执行 git reset --soft {remote_ref} 后重试。"
-        ));
+        warn(&format!("{label} 无法回退未推送提交。"));
+        return false;
     }
 
     // 2) 压缩仍在暂存区的超限文件；已在最新提交里移除/压缩过的（reset 后
@@ -1249,12 +1248,14 @@ fn repair_and_repush(
 
     // 3) 重新暂存（分卷与 .gitignore 入列，源文件已被忽略）并提交。
     if !git_run(repo, &["add", "-A"]) {
-        die(&format!("{label} 修复后 git add 失败。"));
+        warn(&format!("{label} 修复后 git add 失败。"));
+        return false;
     }
     let msg = staged_message(repo);
     println!("  重新提交，提交信息：{msg}");
     if !git_run(repo, &["commit", "-m", &msg]) {
-        die(&format!("{label} 修复后 git commit 失败。"));
+        warn(&format!("{label} 修复后 git commit 失败。"));
+        return false;
     }
 
     // 4) 再次推送（含网络重试）；仍失败则区分为“仍有大文件”或其它错误。
@@ -1267,15 +1268,129 @@ fn repair_and_repush(
             .map(|f| f.path)
             .collect();
         if !remaining.is_empty() {
-            die(&format!(
-                "仍有超过 100MB 的文件未被压缩规避：{}；请确认 7z 分卷已生成后重试 commit push。",
+            warn(&format!(
+                "仍有超过 100MB 的文件未被压缩规避：{}；请确认 7z 分卷已生成后重试。",
                 remaining.join(", ")
             ));
+        } else {
+            warn(&format!("{label} 压缩大文件后仍推送失败，请检查上方输出。"));
         }
-        die(&format!("{label} 压缩大文件后仍推送失败，请检查上方输出。"));
+        return false;
     }
     println!("  [OK] {label} 已在处理超大文件（压缩/重写历史）后推送成功。");
     true
+}
+
+/// 推送一个仓库（主仓库或子模块）：先本地预检大文件，命中则修复；
+/// 否则直接推送（含网络重试）。成功后提示 50MB 建议警告。
+/// 返回是否成功；失败时由调用方负责回滚并中止。
+fn push_repo(root: &Path, repo: &Path, sub_prefix: &str, label: &str, branch: &str) -> bool {
+    let remote_ref = format!("origin/{branch}");
+    // 预检：未推送历史含 >100MB blob 即直接修复。
+    let local_hard = local_hard_large_files(repo, &remote_ref);
+    if !local_hard.is_empty() {
+        return repair_and_repush(root, repo, sub_prefix, label, branch, &local_hard);
+    }
+    let (push_ok, push_err) = push_robust(repo, branch);
+    if !push_ok {
+        // 服务端仍报大文件（预检阈值边界等）：修复；否则视为普通失败。
+        let hard: Vec<LargeFile> = parse_large_files(&push_err)
+            .into_iter()
+            .filter(|f| f.hard)
+            .collect();
+        if !hard.is_empty() {
+            return repair_and_repush(root, repo, sub_prefix, label, branch, &hard);
+        }
+        warn(&format!("{label} push 失败，请检查上方输出。"));
+        return false;
+    }
+    // 成功但存在 50MB 建议警告（不阻断）。
+    for f in parse_large_files(&push_err).iter().filter(|f| !f.hard) {
+        warn(&format!(
+            "分卷 {}（{:.2} MB）超过 GitHub 50MB 建议值（不影响推送）；\
+             如想消除提示，可用当前更小的分卷重新 pack。",
+            join_pack_path(sub_prefix, &f.path),
+            f.size_mb
+        ));
+    }
+    true
+}
+
+/// 从 `git status --porcelain` 行提取路径（前 2 字节为状态码，第 3 字节为空格）。
+/// 重命名形如 "old -> new"，取新路径；去掉 git 对特殊字符加的外层引号。
+fn porcelain_path(line: &str) -> String {
+    let rest = if line.len() >= 4 {
+        line[3..].trim()
+    } else {
+        ""
+    };
+    let p = if let Some(arrow) = rest.find(" -> ") {
+        &rest[arrow + 4..]
+    } else {
+        rest
+    };
+    p.trim().trim_matches('"').replace('\\', "/")
+}
+
+/// 判断路径是否等于或位于某个子模块目录下，返回其索引。
+fn submodule_for_path(subs: &[Submodule], path: &str) -> Option<usize> {
+    let p = path.trim_matches('/').replace('\\', "/");
+    for (i, s) in subs.iter().enumerate() {
+        let sp = s.path.trim_matches('/').replace('\\', "/");
+        if p == sp || p.starts_with(&format!("{sp}/")) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 按需确定需要处理的子模块索引（已初始化），合并两个来源：
+/// 主仓库工作区改动（未跟踪/修改/暂存/重命名，强制显示子模块）；
+/// 以及主仓库未推送历史（已 commit 未 push）涉及的子模块指针。
+/// 其余子模块完全不碰，避免无意义遍历。
+fn changed_submodules(root: &Path, main_remote_ref: &str, subs: &[Submodule]) -> Vec<usize> {
+    let mut idx: HashSet<usize> = HashSet::new();
+
+    let (_, status) = git_capture(root, &["status", "--porcelain", "--ignore-submodules=none"]);
+    for line in status.lines() {
+        if let Some(i) = submodule_for_path(subs, &porcelain_path(line)) {
+            idx.insert(i);
+        }
+    }
+
+    let range = format!("{main_remote_ref}..HEAD");
+    let (ok, names) = git_capture(root, &["diff", "--name-only", &range]);
+    if ok {
+        for line in names.lines() {
+            if let Some(i) = submodule_for_path(subs, line.trim()) {
+                idx.insert(i);
+            }
+        }
+    }
+
+    let mut v: Vec<usize> = idx
+        .into_iter()
+        .filter(|&i| is_initialized(root, &subs[i].path))
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// 撤回本次运行在 repo 上新建的提交（baseline..HEAD），改动退回工作区
+/// （reset --mixed，撤销暂存但不丢文件）；mixed 失败时退回 soft。
+fn rollback_to(repo: &Path, baseline: &str, label: &str) {
+    warn(&format!(
+        "{label} 推送失败，撤回本次提交（reset --mixed {baseline}），改动退回工作区。"
+    ));
+    if git_run(repo, &["reset", "--mixed", baseline]) {
+        return;
+    }
+    warn("mixed 回退失败，尝试 soft 回退...");
+    if !git_run(repo, &["reset", "--soft", baseline]) {
+        warn(&format!(
+            "{label} 无法自动撤回提交，请手动执行：git reset --mixed {baseline}"
+        ));
+    }
 }
 
 fn cmd_push(root: &Path) {
@@ -1305,32 +1420,31 @@ fn cmd_push(root: &Path) {
         die("远程主仓库存在本地没有的新提交，请先执行 commit pull 后再推送。");
     }
 
+    // 按需确定有改动的子模块（工作区改动 + 未推送历史），其余完全跳过。
+    let main_remote_ref = format!("origin/{main_branch}");
+    let target_idx = changed_submodules(root, &main_remote_ref, &submodules);
+    if target_idx.is_empty() {
+        println!("子模块均无改动，跳过子模块处理。");
+    }
+
     let mut changed: Vec<String> = Vec::new();
 
-    for sub in &submodules {
+    for &i in &target_idx {
+        let sub = &submodules[i];
         println!("\n[子模块] {}", sub.path);
-
-        if !is_initialized(root, &sub.path) {
-            println!("  尚未初始化，开始 clone（首次较慢，下方会显示下载进度）...");
-            if !submodule_update_init(root, &["--", sub.path.as_str()], AuthMode::Normal) {
-                die(&format!(
-                    "子模块 {} 初始化失败（已重试仍失败），请检查网络后重试。",
-                    sub.path
-                ));
-            }
-        }
-
         let sub_repo = root.join(&sub.path);
+
+        // 记录本次提交前的 HEAD，用于失败回滚（只撤回本次新建的提交）。
+        let (_, baseline) = git_capture(&sub_repo, &["rev-parse", "HEAD"]);
+
         println!("  拉取远程引用...");
         if !git_run(&sub_repo, &["fetch", "--progress", "origin"]) {
+            // fetch 失败：尚未创建任何提交，无需回滚。
             die(&format!("子模块 {} git fetch 失败。", sub.path));
         }
-        println!("  远程引用已更新。");
-
         // 附着到跟踪分支（首次初始化后处于 detached HEAD）。
         let branch = attach_to_branch(root, sub);
 
-        // 先提交本地工作区改动（若有），随后再统一拉齐远程，避免在旧代码上提交。
         let mut local_committed = false;
         if has_changes(&sub_repo) {
             println!("  发现改动，提交中...");
@@ -1345,51 +1459,33 @@ fn cmd_push(root: &Path) {
             local_committed = true;
         }
 
-        // 远程领先时自动安全快进到最新（远程新提交会通过主仓库更新指针一并纳入）；
-        // 仅当本地与远程分叉、无法线性快进时才中止。
+        // 远程领先时安全快进；分叉则回滚本次提交并中止。
         if !fast_forward_to_origin(&sub_repo, &branch) {
+            if local_committed {
+                rollback_to(&sub_repo, &baseline, &sub.path);
+            }
             die(&format!(
                 "子模块 {} 本地与 origin/{branch} 已分叉，无法自动快进，请先手动合并/变基后再 commit push。",
                 sub.path
             ));
         }
 
-        // 即使本次没有新提交（例如上次 push 因大文件失败、本地仍领先远程），
-        // 只要本地领先 origin/{branch} 就需要推送。
-        let remote_ref = format!("origin/{branch}");
-        let local_ahead = ahead_count(&sub_repo, &remote_ref, "HEAD");
+        // 本次有新提交，或本地领先远程（旧的未推送提交），则推送。
+        let sub_remote_ref = format!("origin/{branch}");
+        let local_ahead = ahead_count(&sub_repo, &sub_remote_ref, "HEAD");
         if local_committed || local_ahead > 0 {
-            // push 前本地预检：未推送历史里若含 >100MB 的 blob（即便在最新提交已被
-            // 删除），直接走修复（重写历史 / 压缩），避免传完才被拒或中途超时。
-            let local_hard = local_hard_large_files(&sub_repo, &remote_ref);
-            if local_hard.is_empty() {
-                println!("  推送到 origin/{branch}...");
-                let (push_ok, push_err) = push_robust(&sub_repo, &branch);
-                let large = parse_large_files(&push_err);
-                if !push_ok {
-                    let hard: Vec<LargeFile> = large.iter().filter(|f| f.hard).cloned().collect();
-                    if hard.is_empty() {
-                        die(&format!("子模块 {} push 失败。", sub.path));
-                    }
-                    // 服务端仍报大文件（预检阈值边界等）：自动修复后再推。
-                    repair_and_repush(root, &sub_repo, &sub.path, &sub.path, &branch, &hard);
-                } else {
-                    // 推送成功但存在 50MB 建议警告（不阻断）。
-                    for f in large.iter().filter(|f| !f.hard) {
-                        warn(&format!(
-                            "分卷 {}（{:.2} MB）超过 GitHub 50MB 建议值（不影响推送）；\
-                             如想消除提示，可用当前更小的分卷重新 pack。",
-                            join_pack_path(&sub.path, &f.path),
-                            f.size_mb
-                        ));
-                    }
-                }
+            println!("  推送到 origin/{branch}...");
+            if push_repo(root, &sub_repo, &sub.path, &sub.path, &branch) {
+                changed.push(sub.path.clone());
+                println!("  [OK] {} 已推送", sub.path);
             } else {
-                // 预检即发现历史大文件，直接修复（内部会重写提交并重新推送）。
-                repair_and_repush(root, &sub_repo, &sub.path, &sub.path, &branch, &local_hard);
+                // 推送失败：撤回本次新建提交（含修复流程造成的改动），退回工作区。
+                rollback_to(&sub_repo, &baseline, &sub.path);
+                die(&format!(
+                    "子模块 {} push 失败，已撤回本次提交，改动保留在工作区。",
+                    sub.path
+                ));
             }
-            changed.push(sub.path.clone());
-            println!("  [OK] {} 已推送", sub.path);
         } else {
             println!("  已与 origin/{branch} 对齐。");
         }
@@ -1398,6 +1494,8 @@ fn cmd_push(root: &Path) {
     // 主仓库提交（子模块指针变更 / commit.exe / 根目录文件等）
     println!("\n[主仓库] 检查待提交内容...");
     if has_changes(root) {
+        // 记录主仓库提交前 HEAD，用于失败回滚。
+        let (_, main_baseline) = git_capture(root, &["rev-parse", "HEAD"]);
         if !git_run(root, &["add", "-A"]) {
             die("主仓库 git add 失败。");
         }
@@ -1406,24 +1504,13 @@ fn cmd_push(root: &Path) {
         if !git_run(root, &["commit", "-m", &msg]) {
             die("主仓库 git commit 失败。");
         }
-        let main_remote_ref = format!("origin/{main_branch}");
-        let local_hard = local_hard_large_files(root, &main_remote_ref);
-        if !local_hard.is_empty() {
-            repair_and_repush(root, root, "", "主仓库", &main_branch, &local_hard);
+        if push_repo(root, root, "", "主仓库", &main_branch) {
+            println!("\n[OK] 全部推送完成。");
         } else {
-            let (push_ok, push_err) = push_robust(root, &main_branch);
-            if !push_ok {
-                let hard: Vec<LargeFile> = parse_large_files(&push_err)
-                    .into_iter()
-                    .filter(|f| f.hard)
-                    .collect();
-                if hard.is_empty() {
-                    die("主仓库 push 失败。");
-                }
-                repair_and_repush(root, root, "", "主仓库", &main_branch, &hard);
-            }
+            // 推送失败：撤回本次提交，改动退回工作区。
+            rollback_to(root, &main_baseline, "主仓库");
+            die("主仓库 push 失败，已撤回本次提交，改动保留在工作区。");
         }
-        println!("\n[OK] 全部推送完成。");
     } else if !changed.is_empty() {
         warn("子模块已推送，但主仓库未检测到指针变更，主仓库无需提交。");
         println!("[OK] 子模块推送完成。");
