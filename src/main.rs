@@ -1316,13 +1316,14 @@ fn push_repo(root: &Path, repo: &Path, sub_prefix: &str, label: &str, branch: &s
     true
 }
 
-/// 从 `git status --porcelain` 行提取路径（前 2 字节为状态码，第 3 字节为空格）。
-/// 重命名形如 "old -> new"，取新路径；去掉 git 对特殊字符加的外层引号。
+/// 从 `git status --porcelain` 行提取路径。状态码为前 1~2 个字符（XY），
+/// 其后以空白分隔路径；注意整段 stdout 被统一 trim 后首行可能丢失前导空格，
+/// 因此不按固定字节位置切片，而是定位第一个空白。重命名 "old -> new" 取新路径。
 fn porcelain_path(line: &str) -> String {
-    let rest = if line.len() >= 4 {
-        line[3..].trim()
-    } else {
-        ""
+    let raw = line.trim();
+    let rest = match raw.find(' ') {
+        Some(pos) => raw[pos + 1..].trim(),
+        None => raw,
     };
     let p = if let Some(arrow) = rest.find(" -> ") {
         &rest[arrow + 4..]
@@ -1494,22 +1495,30 @@ fn cmd_push(root: &Path) {
     // 主仓库提交（子模块指针变更 / commit.exe / 根目录文件等）
     println!("\n[主仓库] 检查待提交内容...");
     if has_changes(root) {
-        // 记录主仓库提交前 HEAD，用于失败回滚。
-        let (_, main_baseline) = git_capture(root, &["rev-parse", "HEAD"]);
         if !git_run(root, &["add", "-A"]) {
             die("主仓库 git add 失败。");
         }
-        let msg = staged_message(root);
-        println!("  提交信息：{msg}");
-        if !git_run(root, &["commit", "-m", &msg]) {
-            die("主仓库 git commit 失败。");
-        }
-        if push_repo(root, root, "", "主仓库", &main_branch) {
-            println!("\n[OK] 全部推送完成。");
+        // add -A 不会把子模块内部文件纳入暂存区。若暂存区为空，说明只是子模块
+        // 内部 dirty（已在子模块循环处理），主仓库没有指针或根文件需要提交，
+        // 不应再执行 commit（否则会因 no changes 失败而误中止）。
+        let (_, staged) = git_capture(root, &["diff", "--cached", "--name-only"]);
+        if staged.trim().is_empty() {
+            warn("主仓库没有可提交的根文件或子模块指针变更，跳过主仓库提交。");
         } else {
-            // 推送失败：撤回本次提交，改动退回工作区。
-            rollback_to(root, &main_baseline, "主仓库");
-            die("主仓库 push 失败，已撤回本次提交，改动保留在工作区。");
+            // 记录主仓库提交前 HEAD，用于失败回滚。
+            let (_, main_baseline) = git_capture(root, &["rev-parse", "HEAD"]);
+            let msg = staged_message(root);
+            println!("  提交信息：{msg}");
+            if !git_run(root, &["commit", "-m", &msg]) {
+                die("主仓库 git commit 失败。");
+            }
+            if push_repo(root, root, "", "主仓库", &main_branch) {
+                println!("\n[OK] 全部推送完成。");
+            } else {
+                // 推送失败：撤回本次提交，改动退回工作区。
+                rollback_to(root, &main_baseline, "主仓库");
+                die("主仓库 push 失败，已撤回本次提交，改动保留在工作区。");
+            }
         }
     } else if !changed.is_empty() {
         warn("子模块已推送，但主仓库未检测到指针变更，主仓库无需提交。");
@@ -2540,6 +2549,37 @@ remote: error: GH001: Large files detected.";
             join_pack_path("Entertainment/", "/zyplayer/app.asar"),
             "Entertainment/zyplayer/app.asar"
         );
+    }
+
+    #[test]
+    fn porcelain_path_extracts_and_renames() {
+        assert_eq!(porcelain_path(" M Entertainment"), "Entertainment");
+        // 首行被整体 trim 吞掉前导空格时，状态码只剩一个字符，仍须正确切出路径。
+        assert_eq!(porcelain_path("M Entertainment"), "Entertainment");
+        assert_eq!(porcelain_path("?? commit.exe"), "commit.exe");
+        assert_eq!(porcelain_path("R100 old.ini -> new.ini"), "new.ini");
+        assert_eq!(porcelain_path(" M \"my file.txt\""), "my file.txt");
+    }
+
+    #[test]
+    fn submodule_membership() {
+        let subs = vec![
+            Submodule {
+                path: "data".into(),
+                url: "u".into(),
+            },
+            Submodule {
+                path: "Entertainment".into(),
+                url: "u".into(),
+            },
+        ];
+        assert_eq!(submodule_for_path(&subs, "Entertainment"), Some(1));
+        assert_eq!(
+            submodule_for_path(&subs, "Entertainment/PotPlayer/x.ini"),
+            Some(1)
+        );
+        assert_eq!(submodule_for_path(&subs, "commit.exe"), None);
+        assert_eq!(submodule_for_path(&subs, "data"), Some(0));
     }
 
     /// 环境相关的 FFI 冒烟测试：枚举本机凭据，验证目标名解析正确。
